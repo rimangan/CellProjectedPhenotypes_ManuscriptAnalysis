@@ -98,10 +98,453 @@ AD_cellscoresWithIds$projid <- rownames(AD_cellscores)
 merged_df_final <- merge(merged_df, AD_cellscoresWithIds, by.x = "projid", by.y = "projid")
 
 # load in inferred AD score (from 005 and Fig 2B)
-inferred_ad_phenotype_df<-readRDS('/Users/timschubert/Documents_on_mac/R Projects/MIT/CPP_subtypes/Data/inferred_AD_phenotype.rds')
+inferred_ad_phenotype_df<-readRDS('Data/inferred_AD_phenotype.rds')
 inferred_ad_phenotype_df$projid <- as.integer(inferred_ad_phenotype_df$projid)
 merged_df_final <- merged_df_final %>%
   dplyr::left_join(inferred_ad_phenotype_df, by = "projid")
+
+## ===== Residualize metabolites by covariates =================
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(purrr); library(stringr)
+})
+
+## ---------- Setups ----
+# metabolites: data.frame with "projid" + metabolite columns, created above
+
+COVARS <- c("pmi","study","fixation_interval","msex")
+
+suppressPackageStartupMessages({
+  library(dplyr); library(rlang)
+})
+metabolites <- metabolites %>% mutate(projid = as.character(projid))
+meta        <- meta %>% mutate(projid = as.character(projid))
+
+## ---------- 1) Build covariate df ----
+
+stopifnot(all(COVARS %in% names(meta)))
+
+cov_df <- meta %>%
+  select(projid, all_of(COVARS)) %>%
+  distinct(projid, .keep_all = TRUE) %>%         
+  mutate(
+    # numeric covariates
+    pmi               = suppressWarnings(as.numeric(pmi)),
+    fixation_interval = suppressWarnings(as.numeric(fixation_interval)),
+    # categorical covariates
+    study             = as.factor(study),
+    msex              = as.factor(msex)
+  )
+
+## ---------- 2) Join covariates to metabolites; keep only rows with complete covariates ----
+dat <- metabolites %>%
+  left_join(cov_df, by = "projid") %>%
+  filter(if_all(all_of(COVARS), ~ !is.na(.)))     
+
+# Identify metabolite columns 
+meta_cols <- setdiff(names(metabolites), "projid")
+stopifnot(length(meta_cols) > 0)
+
+## ---------- 3) Residualization function (y ~ covars per metabolite) ----
+residualize_one <- function(y, X_df) {
+  # rows with complete covariates and non-missing metabolite
+  ok <- complete.cases(X_df) & !is.na(y)
+  res <- rep(NA_real_, length(y))
+  coefs <- NA
+  
+  if (sum(ok) >= (ncol(model.matrix(~ ., data = X_df)) + 1)) {
+    # Build design matrix with intercept and default contrasts
+    X <- model.matrix(~ ., data = X_df[ok, , drop = FALSE])
+    fit <- lm.fit(x = X, y = y[ok])
+    res[ok] <- y[ok] - (X %*% fit$coefficients)[, 1]
+    coefs <- setNames(unname(fit$coefficients), colnames(X))
+  }
+  list(residuals = res, coefs = coefs)
+}
+
+# Prepare the covariate design table (no ID)
+X_all <- dat %>% select(all_of(COVARS))
+
+## ---------- 4) Apply to every metabolite ----
+res_list <- lapply(meta_cols, function(met) {
+  out <- residualize_one(dat[[met]], X_all)
+  list(name = met, resid = out$residuals, coefs = out$coefs)
+})
+
+# Collect residuals into a wide data.frame
+res_mat <- do.call(cbind, lapply(res_list, `[[`, "resid"))
+colnames(res_mat) <- paste0(meta_cols, "_res")
+metabolites_resid <- cbind(projid = dat$projid, as.data.frame(res_mat))
+
+## ---------- 5) Save outputs ----
+dir.create("Results/Metabolites_residualized", recursive = TRUE, showWarnings = FALSE)
+saveRDS(metabolites_resid, file = "Results/Metabolites_residualized/metabolites_residualized_by_pmi_study_fix_msex.rds")
+
+coef_tbl <- purrr::map_dfr(res_list, function(x) {
+  tibble(metabolite = x$name,
+         term = names(x$coefs),
+         estimate = unname(x$coefs))
+})
+saveRDS(coef_tbl, file = "Results/Metabolites_residualized/metabolite_models_coefficients.rds")
+
+## ---------- 6) sanity checks ----
+message("Residualized matrix dims: ", nrow(metabolites_resid), " x ", ncol(metabolites_resid))
+message("Example head (first 5 residualized metabolites):")
+print(metabolites_resid[1:5, c("projid", colnames(metabolites_resid)[2:min(6, ncol(metabolites_resid))])])
+
+
+
+
+
+
+## ===== Projid overlap metabolites and single cell data
+
+meta<-load_BIG_meta_data()
+
+library(eulerr)
+
+ids <- list(
+  metabolites_resid = unique(as.character(metabolites_resid$projid)),
+  merged_df_final   = unique(as.character(merged_df_final$projid)),
+  meta              = unique(as.character(meta$projid))
+)
+
+plot(
+  euler(ids),
+  quantities = TRUE, labels = TRUE,
+  fills = list(fill = c("#4E79A7","#F28E2B","#E15759"), alpha = 0.35),
+  edges = list(col = "grey20"),
+  main = "projid overlap"
+)
+
+# Define ID sets
+ids <- list(
+  metabolites_resid = unique(as.character(metabolites_resid$projid)),
+  merged_df_final   = unique(as.character(merged_df_final$projid))
+)
+
+# Generate Euler diagram
+pdf("Results/projid_overlap_metabolites_vs_merged_df_final.pdf", width = 4, height = 4)
+
+plot(
+  euler(ids),
+  quantities = TRUE,
+  labels = TRUE,
+  fills = list(fill = c("#606c38", "#bc6c25"), alpha = 0.85),
+  edges = list(col = "grey20"),
+  main = "projid overlap (metabolites vs merged_df_final)"
+)
+
+dev.off()
+
+# --- Collect unique IDs ---
+met_ids <- unique(as.character(metabolites_resid$projid))
+sc_ids  <- unique(as.character(merged_df_final$projid))
+
+# --- Compute sets ---
+met_only      <- setdiff(met_ids, sc_ids)
+singlecell_only <- setdiff(sc_ids, met_ids)
+both          <- intersect(met_ids, sc_ids)
+
+# --- Assemble into a tidy data frame ---
+projid_df <- data.frame(
+  projid = c(met_only, singlecell_only, both),
+  group  = c(
+    rep("metabolites_only", length(met_only)),
+    rep("singlecell_only", length(singlecell_only)),
+    rep("metabolites_and_singlecell", length(both))
+  ),
+  stringsAsFactors = FALSE
+)
+
+head(projid_df)
+
+
+## ===== GLMNET prediction of AD status based on metabolite profiles =====
+suppressPackageStartupMessages({
+  library(dplyr); library(readr); library(ggplot2)
+  library(pROC); library(yardstick); library(glmnet); library(broom)
+  library(patchwork)
+})
+
+set.seed(123)
+OUT <- "Results/GLMNET_AD_solid"
+dir.create(OUT, recursive = TRUE, showWarnings = FALSE)
+
+## ---------- 0) Inputs & labels from meta  +  collapse replicates by projid (median) ----------
+suppressPackageStartupMessages({ library(dplyr) })
+
+meta <- load_BIG_meta_data()
+
+stopifnot(all(c("projid") %in% names(metabolites_resid)))
+stopifnot(all(c("projid","AD_status") %in% names(meta)))
+stopifnot(length(met_only) > 0, length(both) > 0)
+
+# 1) Build a deduplicated label table (one row per projid)
+label_raw <- meta %>%
+  mutate(projid = as.character(projid)) %>%
+  select(projid, AD_status) %>%
+  filter(!is.na(AD_status))
+
+# check for conflicts
+label_chk <- label_raw %>%
+  group_by(projid) %>%
+  summarise(n = n(), n_pos = sum(AD_status == 1), n_neg = sum(AD_status == 0), .groups = "drop")
+
+conflicts <- label_chk %>% filter(n_pos > 0 & n_neg > 0)
+if (nrow(conflicts) > 0) {
+  warning("Conflicting AD_status for some projid in meta; resolving by majority vote (ties -> 1).")
+}
+
+label_df <- label_raw %>%
+  group_by(projid) %>%
+  summarise(
+    AD_status = {
+      v <- AD_status
+      ones <- sum(v == 1); zeros <- sum(v == 0)
+      if (zeros > ones) 0L else 1L
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(AD_status = as.integer(AD_status))
+
+# 2) Collapse metabolite replicates (median)
+agg_fun <- function(x) suppressWarnings(stats::median(x, na.rm = TRUE))
+feat_cols_all <- grep("_res$", names(metabolites_resid), value = TRUE)
+stopifnot(length(feat_cols_all) > 0)
+
+met_agg <- metabolites_resid %>%
+  mutate(projid = as.character(projid)) %>%
+  group_by(projid) %>%
+  summarise(
+    dplyr::across(all_of(feat_cols_all), agg_fun),
+    n_reps = dplyr::n(),
+    .groups = "drop"
+  )
+
+# 3) Join (labels are now unique per projid)
+dat_all <- met_agg %>%
+  inner_join(label_df, by = "projid") %>%
+  filter(AD_status %in% c(0,1))
+
+feat_cols <- grep("_res$", names(dat_all), value = TRUE)
+stopifnot(length(feat_cols) > 0)
+
+# 4) Split & matrices
+train_df <- dat_all %>% filter(projid %in% as.character(met_only))
+test_df  <- dat_all %>% filter(projid %in% as.character(both))
+
+
+stopifnot(nrow(train_df) == dplyr::n_distinct(train_df$projid))
+stopifnot(nrow(test_df)  == dplyr::n_distinct(test_df$projid))
+
+X_tr_raw <- as.matrix(train_df[, feat_cols, drop = FALSE])
+X_te_raw <- as.matrix(test_df[,  feat_cols, drop = FALSE])
+y_tr <- train_df$AD_status
+y_te <- test_df$AD_status
+
+message("Projids in train_df:", length(train_df$projid), " Projids in test_df:", length(test_df$projid))
+
+message("Replicate collapse complete: TRAIN projids = ", nrow(train_df),
+        " | TEST projids = ", nrow(test_df))
+
+
+
+## ---------- 1) Train-only imputation & scaling  --------
+med_tr <- apply(X_tr_raw, 2, function(v) suppressWarnings(median(v, na.rm = TRUE)))
+med_tr[!is.finite(med_tr)] <- 0
+impute <- function(M, med) { if (anyNA(M)) { idx <- which(is.na(M), arr.ind = TRUE); M[idx] <- med[idx[,2]] }; M }
+X_tr_imp <- impute(X_tr_raw, med_tr); X_te_imp <- impute(X_te_raw, med_tr)
+
+mu  <- colMeans(X_tr_imp)
+sdv <- apply(X_tr_imp, 2, sd); sdv[!is.finite(sdv) | sdv == 0] <- 1
+scale_mat <- function(M, mu, sdv) sweep(sweep(M, 2, mu, "-"), 2, sdv, "/")
+X_tr_sc <- scale_mat(X_tr_imp, mu, sdv); X_te_sc <- scale_mat(X_te_imp, mu, sdv)
+
+## ---------- 2) Nested CV: tune alpha & lambda --------
+# Outer CV selects alpha; inner CV selects lambda for each alpha.
+alphas <- c(0.0, 0.25, 0.5, 0.75, 1.0)
+Kouter <- 5
+fold_id <- sample(rep(1:Kouter, length.out = length(y_tr)))
+
+w_class <- if (sum(y_tr==1)>0) ifelse(y_tr==1, sum(y_tr==0)/sum(y_tr==1), 1) else rep(1, length(y_tr))
+
+outer_auc <- data.frame(alpha = numeric(), auc = numeric())
+for (a in alphas) {
+  cv_inner <- cv.glmnet(X_tr_sc, y_tr, family = "binomial", alpha = a,
+                        type.measure = "auc", weights = w_class, nfolds = 10,
+                        standardize = FALSE)
+  lam <- cv_inner$lambda.1se
+  # outer CV estimate using chosen lam
+  preds <- rep(NA_real_, length(y_tr))
+  for (k in 1:Kouter) {
+    tr_idx <- which(fold_id != k); va_idx <- which(fold_id == k)
+    fit_k <- glmnet(X_tr_sc[tr_idx, , drop = FALSE], y_tr[tr_idx],
+                    family = "binomial", alpha = a, lambda = lam,
+                    weights = w_class[tr_idx], standardize = FALSE)
+    preds[va_idx] <- as.numeric(predict(fit_k, X_tr_sc[va_idx, , drop = FALSE], type = "response"))
+  }
+  auc_k <- as.numeric(pROC::auc(y_tr, preds))
+  outer_auc <- rbind(outer_auc, data.frame(alpha = a, auc = auc_k))
+}
+best_alpha <- outer_auc$alpha[which.max(outer_auc$auc)]
+readr::write_csv(outer_auc, file.path(OUT, "nested_outer_auc_alpha.csv"))
+
+## ---------- 3) Fit final model on all TRAIN with best alpha + lambda.1se (inner CV) ----
+cv_final <- cv.glmnet(X_tr_sc, y_tr, family = "binomial", alpha = best_alpha,
+                      type.measure = "auc", weights = w_class, nfolds = 10, standardize = FALSE)
+lam_final <- cv_final$lambda.1se
+fit_glm <- glmnet(X_tr_sc, y_tr, family = "binomial", alpha = best_alpha,
+                  lambda = lam_final, weights = w_class, standardize = FALSE)
+
+## ---------- 4) Predict on HELD-OUT TEST --------
+p_te <- as.numeric(predict(fit_glm, X_te_sc, type = "response"))
+
+## ---------- 5) Metrics, threshold grid, and plots --------
+brier <- mean((p_te - y_te)^2)
+logloss <- { p <- pmin(pmax(p_te,1e-15),1-1e-15); -mean(y_te*log(p)+(1-y_te)*log(1-p)) }
+auc_te <- as.numeric(pROC::auc(y_te, p_te))
+eval_te <- tibble(AD_status = factor(y_te, levels=c(0,1), labels=c("nonAD","AD")), .pred_AD = p_te)
+pr_te <- yardstick::pr_auc(eval_te, truth = AD_status, .pred_AD)$.estimate
+roc_te <- yardstick::roc_curve(eval_te, truth = AD_status, .pred_AD)
+prc_te <- yardstick::pr_curve(eval_te, truth = AD_status, .pred_AD)
+
+# Youden threshold
+th_te <- roc_te %>%
+  mutate(J = sensitivity + specificity - 1) %>%
+  slice_max(J, n = 1) %>% slice_head(n = 1) %>% pull(.threshold) %>% as.numeric()
+if (!is.finite(th_te)) th_te <- 0.5
+
+# Threshold grid
+ths <- seq(0,1,by=0.01)
+grid <- lapply(ths, function(t) {
+  lab <- factor(ifelse(p_te >= t, "AD","nonAD"), levels=c("nonAD","AD"))
+  tibble(
+    threshold = t,
+    accuracy = yardstick::accuracy_vec(eval_te$AD_status, lab),
+    sensitivity = yardstick::sensitivity_vec(eval_te$AD_status, lab),
+    specificity = yardstick::specificity_vec(eval_te$AD_status, lab),
+    ppv = yardstick::ppv_vec(eval_te$AD_status, lab),
+    npv = yardstick::npv_vec(eval_te$AD_status, lab)
+  )
+}) %>% bind_rows()
+write_csv(grid, file.path(OUT, "threshold_grid_test.csv"))
+
+# Save metrics summary
+write_csv(
+  tibble(model="GLMNET", alpha=best_alpha, lambda=lam_final,
+         auc=auc_te, pr_auc=pr_te, brier=brier, log_loss=logloss,
+         threshold_Youden=th_te),
+  file.path(OUT,"metrics_test_summary.csv")
+)
+
+# Plots
+p_roc <- ggplot(roc_te, aes(x = 1 - specificity, y = sensitivity)) +
+  geom_path() + coord_equal() + theme_classic() + ggtitle(sprintf("ROC (AUC = %.3f)", auc_te))
+ggsave(file.path(OUT,"ROC_glmnet.pdf"), p_roc, width=5, height=4)
+
+p_pr <- ggplot(prc_te, aes(x = recall, y = precision)) +
+  geom_path() + theme_classic() + ggtitle(sprintf("PR (PR-AUC = %.3f)", pr_te))
+ggsave(file.path(OUT,"PR_glmnet.pdf"), p_pr, width=5, height=4)
+
+
+p_dens <- ggplot(
+  tibble(pred = p_te, AD_status = factor(y_te, levels = c(0, 1), labels = c("nonAD", "AD"))),
+  aes(x = pred, fill = AD_status)
+) +
+  geom_density(alpha = 0.45) +
+  geom_vline(xintercept = th_te, linetype = "dashed") +
+  scale_fill_manual(values = c("nonAD" = "blue", "AD" = "red")) +
+  theme_classic() +
+  labs(
+    x = "Predicted AD probability",
+    y = "Density",
+    title = "Prediction distribution"
+  )
+ggsave(file.path(OUT, "pred_density_by_true_status.pdf"), p_dens, width = 6, height = 4)
+
+# Calibration (reliability) curve via deciles
+cal_df <- tibble(pred=p_te, y=y_te) %>%
+  mutate(bin = cut(pred, breaks = quantile(pred, probs = seq(0,1,0.1), na.rm=TRUE),
+                   include.lowest = TRUE)) %>%
+  group_by(bin) %>%
+  summarise(pred_mean = mean(pred), obs_rate = mean(y), .groups="drop")
+p_cal <- ggplot(cal_df, aes(x=pred_mean, y=obs_rate)) +
+  geom_abline(slope=1, intercept=0, linetype="dotted") +
+  geom_point() + geom_line() + coord_equal() +
+  theme_classic() + labs(x="Mean predicted probability", y="Observed AD rate", title="Calibration (deciles)")
+ggsave(file.path(OUT,"calibration_deciles.pdf"), p_cal, width=5.2, height=5)
+
+## ---------- 6) Export per-donor TEST predictions --------
+pred_test <- tibble(
+  projid = test_df$projid,
+  AD_status_true = factor(y_te, levels=c(0,1), labels=c("nonAD","AD")),
+  pred_AD_prob_glmnet = p_te,
+  pred_AD_label_glmnet = factor(ifelse(p_te >= th_te, "AD","nonAD"), levels=c("nonAD","AD")),
+  threshold_used = th_te
+)
+write_csv(pred_test, file.path(OUT,"predictions_test_both.csv"))
+
+## ---------- 7) merge into merged_df_final
+if (exists("merged_df_final")) {
+  merged_df_final <- merged_df_final %>%
+    mutate(projid = as.character(projid)) %>%
+    left_join(pred_test %>% select(projid, pred_AD_prob_glmnet, pred_AD_label_glmnet),
+              by = "projid")
+  saveRDS(merged_df_final, file.path(OUT,"merged_df_final_with_glmnet_preds.rds"))
+}
+
+## ---------- 8) Feature importance --------
+# (A) Coefficients at final lambda (standardized scale)
+coef_tbl <- as.matrix(coef(fit_glm))[,1, drop = FALSE]
+coef_tbl <- tibble(Feature = rownames(coef_tbl), Coef = as.numeric(coef_tbl)) %>%
+  filter(Feature != "(Intercept)") %>% arrange(desc(abs(Coef)))
+write_csv(coef_tbl, file.path(OUT,"coefficients_final.csv"))
+
+p_coef <- ggplot(head(coef_tbl, 25), aes(x = reorder(Feature, abs(Coef)), y = Coef)) +
+  geom_col() + coord_flip() + theme_classic() + labs(x=NULL, y="Standardized coefficient",
+                                                     title="Top 25 |β| (GLMNET)")
+ggsave(file.path(OUT,"importance_coefficients_top25.pdf"), p_coef, width=6.5, height=5)
+
+# (B) Permutation importance on TEST (AUC drop per feature)
+perm_imp <- lapply(feat_cols, function(f) {
+  X_perm <- X_te_sc
+  X_perm[, f] <- sample(X_perm[, f])
+  p_perm <- as.numeric(predict(fit_glm, X_perm, type="response"))
+  data.frame(Feature=f, delta_auc = auc_te - as.numeric(pROC::auc(y_te, p_perm)))
+}) %>% bind_rows() %>% arrange(desc(delta_auc))
+write_csv(perm_imp, file.path(OUT,"importance_permutation_auc_drop_test.csv"))
+
+p_perm <- ggplot(head(perm_imp, 25), aes(x = reorder(Feature, delta_auc), y = delta_auc)) +
+  geom_col() + coord_flip() + theme_classic() + labs(x=NULL, y="AUC drop on permutation",
+                                                     title="Permutation importance (TEST)")
+ggsave(file.path(OUT,"importance_permutation_top25.pdf"), p_perm, width=6.5, height=5)
+
+# (C) Stability selection (bootstrap selection frequency on TRAIN)
+B <- 100
+set.seed(123)
+sel_freq <- setNames(numeric(length(feat_cols)), feat_cols)
+for (b in 1:B) {
+  idx <- sample.int(nrow(X_tr_sc), replace = TRUE)
+  cvb <- cv.glmnet(X_tr_sc[idx, , drop = FALSE], y_tr[idx],
+                   family="binomial", alpha=best_alpha, type.measure="auc",
+                   weights=w_class[idx], nfolds=5, standardize=FALSE)
+  fitb <- glmnet(X_tr_sc[idx, , drop = FALSE], y_tr[idx], family="binomial",
+                 alpha=best_alpha, lambda=cvb$lambda.1se, weights=w_class[idx], standardize=FALSE)
+  nz <- rownames(coef(fitb))[which(as.numeric(coef(fitb)) != 0)]
+  nz <- setdiff(nz, "(Intercept)")
+  sel_freq[nz] <- sel_freq[nz] + 1
+}
+stab_tbl <- tibble(Feature = names(sel_freq), sel_freq = as.numeric(sel_freq)/B) %>%
+  arrange(desc(sel_freq))
+write_csv(stab_tbl, file.path(OUT,"importance_stability_selection_freq.csv"))
+
+p_stab <- ggplot(head(stab_tbl, 25), aes(x = reorder(Feature, sel_freq), y = sel_freq)) +
+  geom_col() + coord_flip() + theme_classic() +
+  labs(x=NULL, y="Selection frequency", title="Stability selection (TRAIN bootstraps)")
+ggsave(file.path(OUT,"importance_stability_top25.pdf"), p_stab, width=6.5, height=5)
+
+message("✅ GLMNET pipeline done. Outputs in: ", normalizePath(OUT))
+
 
 ## ===== Create main heatmap ====
 
@@ -451,274 +894,401 @@ merged_df_final <- merged_df_final %>%
 
 table(merged_df_final$subgroup)
 
-saveRDS(merged_df_final,"merged_df_final_11_03.rds")
+saveRDS(merged_df_final,"Data/merged_df_final_03_11_2026.rds")
 
-## ===== Boxplots comparing pathology and clinical outcomes =====
-library(ggplot2)
-library(dplyr)
-library(tidyr)
+## ===== Boxplots + Contrasts between subgroups =====
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(ggsignif)
+  library(stringr)
+  library(purrr)
+  library(grid)
+  library(readr)
+})
 
-# Factor ordering
-df_clusters$AD_status <- factor(df_clusters$AD_status, levels = c("0", "1"))
-df_clusters$cluster_label <- factor(df_clusters$cluster_label, levels = c("K1", "K2", "K3"))
+## ---------- 1. NAMING SCHEME ─────────────────────────────────────────
+tx_label_map   <- c("K1" = "TxNon", "K2" = "TxMid", "K3" = "TxAD")
+path_label_map <- c("0" = "PathNon", "1" = "PathAD")
+tx_levels      <- c("TxNon", "TxMid", "TxAD")
+group_levels_paper <- c(
+  "PathNon;TxNon", "PathNon;TxMid", "PathNon;TxAD",
+  "PathAD;TxNon",  "PathAD;TxMid",  "PathAD;TxAD"
+)
 
-# Create combined group variable (cluster x AD_status)
-df_clusters <- df_clusters %>%
-  mutate(group = interaction(cluster_label, AD_status, sep = "_"))
+## ---------- 2. VARIABLES ─────────────────────────────────────────────
+plot_vars     <- c("gpath", "cogn_decline", "CR", "pred_AD_prob_glmnet")
+contrast_vars <- c("gpath", "cogn_decline", "pred_AD_prob_glmnet") 
 
-# Create a "Total" group for overall distribution per cluster
-df_overall <- df_clusters %>%
-  mutate(group = as.character(cluster_label),
-         AD_status = "overall")
+outcome_labels <- c(
+  gpath               = "Global Pathology",
+  cogn_decline        = "Cognitive Decline",
+  CR                  = "Cognitive Resilience",
+  pred_AD_prob_glmnet = "Metabolite-based\nPredicted AD Probability"
+)
 
-# Combine
-df_combined <- bind_rows(df_clusters, df_overall)
+tx_palette <- c("TxNon" = "#264653", "TxMid" = "#f38b20", "TxAD" = "#ad2524")
 
-# Reshape to long format for plotting multiple variables
-df_long <- df_combined %>%
-  pivot_longer(cols = c("cogn_decline", "CR", "gpath","pred_AD_prob_glmnet"),
-               names_to = "variable",
-               values_to = "value")
+## ---------- 3. BUILD df ────────────────────────────────────────
+missing_vars <- setdiff(plot_vars, names(df_clusters))
+if (length(missing_vars) > 0) {
+  message("Joining missing columns from merged_df_final: ",
+          paste(missing_vars, collapse = ", "))
+  df_clusters <- df_clusters %>%
+    mutate(projid = as.character(projid)) %>%
+    left_join(
+      merged_df_final %>%
+        mutate(projid = as.character(projid)) %>%
+        select(projid, all_of(missing_vars)),
+      by = "projid"
+    )
+}
 
-# Set order for group variable 
-group_levels <- c("K1_0","K1_1","K1","K2_0","K2_1","K2","K3_0","K3_1","K3")
-df_long$group <- factor(df_long$group, levels = group_levels)
+df_paper <- df_clusters %>%
+  mutate(
+    tx_group   = tx_label_map[as.character(cluster_label)],
+    path_group = path_label_map[as.character(AD_status)],
+    full_group = paste0(path_group, ";", tx_group),
+    full_group = factor(full_group, levels = group_levels_paper),
+    tx_group   = factor(tx_group,   levels = tx_levels)
+  ) %>%
+  filter(!is.na(full_group))
 
-# Set colors
-fill_colors <- c("0" = "steelblue", "1" = "firebrick", "overall" = "gray60")
+## ---------- 4. CONTRAST DEFINITIONS ──────────────────────────────────
 
-# Plot
-ggplot(df_long, aes(x = group, y = value, fill = AD_status)) +
-  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
-  geom_jitter(width = 0.15, size = 0.8, alpha = 0.3) +
-  facet_wrap(~ variable, scales = "free_y", nrow = 1) +
-  scale_fill_manual(values = fill_colors) +
-  labs(x = "Cluster × AD Status (incl. overall)", y = "Value") +
-  theme_bw(base_size = 10) +
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1),
-    panel.grid.minor = element_blank(),
-    legend.position = "top"
+# A) ALL: 3 pairwise Tx contrasts (Path collapsed)
+contrasts_all <- tribble(
+  ~contrast_label,        ~g1,     ~g2,     ~axis,
+  "ALL: TxNon vs TxMid",  "TxNon", "TxMid", "within_ALL",
+  "ALL: TxMid vs TxAD",   "TxMid", "TxAD",  "within_ALL",
+  "ALL: TxNon vs TxAD",   "TxNon", "TxAD",  "within_ALL"
+)
+
+# B) Stratified: 9 pre-specified Path×Tx contrasts
+contrasts_9 <- tribble(
+  ~contrast_label,             ~g1,             ~g2,             ~axis,
+  "PathAD: TxNon vs TxMid",   "PathAD;TxNon",  "PathAD;TxMid",  "within_PathAD",
+  "PathAD: TxMid vs TxAD",    "PathAD;TxMid",  "PathAD;TxAD",   "within_PathAD",
+  "PathAD: TxNon vs TxAD",    "PathAD;TxNon",  "PathAD;TxAD",   "within_PathAD",
+  "PathNon: TxNon vs TxMid",  "PathNon;TxNon", "PathNon;TxMid", "within_PathNon",
+  "PathNon: TxMid vs TxAD",   "PathNon;TxMid", "PathNon;TxAD",  "within_PathNon",
+  "PathNon: TxNon vs TxAD",   "PathNon;TxNon", "PathNon;TxAD",  "within_PathNon",
+  "TxNon: PathNon vs PathAD", "PathNon;TxNon", "PathAD;TxNon",  "within_Tx",
+  "TxMid: PathNon vs PathAD", "PathNon;TxMid", "PathAD;TxMid",  "within_Tx",
+  "TxAD:  PathNon vs PathAD", "PathNon;TxAD",  "PathAD;TxAD",   "within_Tx"
+)
+
+## ---------- 5. WELCH T-TEST ───────────────
+# BH correction is applied AFTER binding both sets so all 12
+# contrasts per outcome variable are corrected as one family.
+run_welch_raw <- function(df, group_var, vars, contrasts_df) {
+  map_dfr(vars, function(v) {
+    map_dfr(seq_len(nrow(contrasts_df)), function(i) {
+      g1_data <- df %>%
+        filter(!!sym(group_var) == contrasts_df$g1[i]) %>%
+        pull(!!sym(v)) %>% na.omit()
+      g2_data <- df %>%
+        filter(!!sym(group_var) == contrasts_df$g2[i]) %>%
+        pull(!!sym(v)) %>% na.omit()
+      
+      if (length(g1_data) < 2 || length(g2_data) < 2) {
+        return(tibble(
+          variable = v, contrast_label = contrasts_df$contrast_label[i],
+          g1 = contrasts_df$g1[i], g2 = contrasts_df$g2[i],
+          axis = contrasts_df$axis[i],
+          n1 = length(g1_data), n2 = length(g2_data),
+          mean1 = NA_real_, mean2 = NA_real_, mean_diff = NA_real_,
+          t_stat = NA_real_, df_welch = NA_real_, p_raw = NA_real_
+        ))
+      }
+      tt <- t.test(g1_data, g2_data, var.equal = FALSE)
+      tibble(
+        variable = v, contrast_label = contrasts_df$contrast_label[i],
+        g1 = contrasts_df$g1[i], g2 = contrasts_df$g2[i],
+        axis = contrasts_df$axis[i],
+        n1 = length(g1_data), n2 = length(g2_data),
+        mean1 = mean(g1_data), mean2 = mean(g2_data),
+        mean_diff = mean(g1_data) - mean(g2_data),
+        t_stat = tt$statistic, df_welch = tt$parameter,
+        p_raw = tt$p.value
+      )
+    })
+  })
+}
+
+# Run both sets
+raw_all        <- run_welch_raw(df_paper, "tx_group",   contrast_vars, contrasts_all) %>%
+  mutate(contrast_set = "ALL")
+raw_stratified <- run_welch_raw(df_paper, "full_group", contrast_vars, contrasts_9) %>%
+  mutate(contrast_set = "stratified")
+
+# BH correction across all 12 contrasts per outcome variable
+contrast_results <- bind_rows(raw_all, raw_stratified) %>%
+  group_by(variable) %>%
+  mutate(
+    p_adj_BH = p.adjust(p_raw, method = "BH"),
+    stars = case_when(
+      is.na(p_adj_BH)  ~ "",
+      p_adj_BH < 0.001 ~ "***",
+      p_adj_BH < 0.01  ~ "**",
+      p_adj_BH < 0.05  ~ "*",
+      TRUE             ~ "ns"
+    )
+  ) %>%
+  ungroup()
+
+# Split back for downstream plot annotation
+contrast_results_all        <- contrast_results %>% filter(contrast_set == "ALL")
+contrast_results_stratified <- contrast_results %>% filter(contrast_set == "stratified")
+
+## ---------- 6. SAVE COMBINED TABLE ────────────────────────────────────
+dir.create("Results/Clustered_heatmaps/contrasts",
+           recursive = TRUE, showWarnings = FALSE)
+
+contrast_results %>%
+  mutate(
+    Subgroup = case_when(
+      contrast_set == "ALL"         ~ "ALL (Path collapsed)",
+      str_detect(axis, "PathAD")    ~ "AD only",
+      str_detect(axis, "PathNon")   ~ "non-AD only",
+      str_detect(axis, "within_Tx") ~ "within Tx (PathNon vs PathAD)",
+      TRUE                          ~ contrast_set
+    ),
+    variable = outcome_labels[variable],
+    across(c(mean1, mean2, mean_diff, t_stat, df_welch), ~ round(.x, 3)),
+    p_raw    = signif(p_raw,    3),
+    p_adj_BH = signif(p_adj_BH, 3)
+  ) %>%
+  select(-contrast_set) %>%
+  rename(
+    Outcome       = variable,
+    Subgroup      = Subgroup,
+    Contrast      = contrast_label,
+    `Group 1`     = g1,
+    `Group 2`     = g2,
+    Axis          = axis,
+    `n (Group 1)` = n1,
+    `n (Group 2)` = n2,
+    `Mean (G1)`   = mean1,
+    `Mean (G2)`   = mean2,
+    `Mean diff`   = mean_diff,
+    t             = t_stat,
+    `df (Welch)`  = df_welch,
+    `p (raw)`     = p_raw,
+    `p (BH-adj)`  = p_adj_BH,
+    `Sig.`        = stars
+  ) %>%
+  arrange(Outcome, Subgroup, Axis) %>%
+  readr::write_csv(
+    "Results/Clustered_heatmaps/contrasts/welch_BH_all_contrasts.csv"
   )
 
+message("Contrast table saved: welch_BH_all_contrasts.csv")
 
-# Faceted boxplots for several variables from df_clusters
-# one-way ANOVA per (variable, subgroup) with Tukey HSD post-hoc tests
+## ---------- 7. BOXPLOT ───────────────────────────────────────────────
 
-plot_cluster_boxpanels_faceted <- function(
-    df_clusters,
-    vars                  = c("gpath","cogn_decline","CR"),
-    palette               = NULL,
-    out_dir               = "Results/Clustered_heatmaps/boxplots",
-    out_file_stem         = "boxpanels_ANOVA_Tukey_faceted",
-    width                 = 12,
-    height                = 6,
-    base_size             = 10
-){
+
+plot_combined_boxplots <- function(
+    df_paper,
+    contrast_results_all,
+    contrast_results_stratified,
+    plot_vars     = c("gpath", "cogn_decline", "CR", "pred_AD_prob_glmnet"),
+    contrast_vars = c("gpath", "cogn_decline", "pred_AD_prob_glmnet"),
+    out_dir       = "Results/Clustered_heatmaps/contrasts",
+    out_file_stem = "boxplot_combined_contrasts",
+    width         = 5,
+    height        = 7,
+    base_size     = 10
+) {
   suppressPackageStartupMessages({
     library(dplyr); library(tidyr); library(ggplot2)
-    library(ggsignif); library(stringr); library(purrr); library(grid)
+    library(ggsignif); library(stringr); library(grid)
   })
   
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
   
-  # ---------- helpers ----------
-  prettify_cluster <- function(k){
-    lab <- c(K1 = "non-AD-like Tx", K2 = "intermediate Tx", K3 = "AD-like Tx")
-    kk  <- as.character(k)
-    out <- unname(lab[kk])
-    out[is.na(out)] <- kk[is.na(out)]
-    out
-  }
-  p_to_stars <- function(p){
-    dplyr::case_when(
-      is.na(p)  ~ "",
-      p < 0.001 ~ "***",
-      p < 0.01  ~ "**",
-      p < 0.05  ~ "*",
-      TRUE      ~ ""
-    )
-  }
+  # ── panel datasets ──
+  dat_ALL <- df_paper %>%
+    mutate(subgroup = "ALL", x_group = as.character(tx_group))
+  dat_AD <- df_paper %>%
+    filter(path_group == "PathAD") %>%
+    mutate(subgroup = "AD", x_group = as.character(full_group))
+  dat_nonAD <- df_paper %>%
+    filter(path_group == "PathNon") %>%
+    mutate(subgroup = "non-AD", x_group = as.character(full_group))
   
-  # ---------- input checks ----------
-  need_cols <- c("projid","cluster_label","AD_status", vars)
-  missing   <- setdiff(need_cols, names(df_clusters))
-  if (length(missing) > 0) {
-    stop("df_clusters is missing columns: ", paste(missing, collapse = ", "))
-  }
+  all_x_levels <- c(
+    "TxNon", "TxMid", "TxAD",
+    "PathAD;TxNon", "PathAD;TxMid", "PathAD;TxAD",
+    "PathNon;TxNon", "PathNon;TxMid", "PathNon;TxAD"
+  )
   
-  # ---------- normalize inputs ----------
-  dat <- df_clusters %>%
-    transmute(
-      projid        = as.character(projid),
-      cluster       = case_when(
-        cluster_label %in% c("K1","K2","K3") ~ as.character(cluster_label),
-        str_detect(cluster_label, "^[Kk]?1$|^K?0?1$") ~ "K1",
-        str_detect(cluster_label, "^[Kk]?2$|^K?0?2$") ~ "K2",
-        str_detect(cluster_label, "^[Kk]?3$|^K?0?3$") ~ "K3",
-        TRUE ~ as.character(cluster_label)
-      ),
-      AD_status     = factor(as.character(AD_status), levels = c("0","1")),
-      !!!rlang::syms(vars)
-    ) %>%
+  dat_sub <- bind_rows(dat_ALL, dat_AD, dat_nonAD) %>%
     mutate(
-      cluster            = factor(cluster, levels = c("K1","K2","K3"), ordered = TRUE),
-      cluster_pretty_chr = prettify_cluster(cluster),
-      cluster_pretty     = factor(cluster_pretty_chr,
-                                  levels = c("non-AD-like Tx","intermediate Tx","AD-like Tx"),
-                                  ordered = TRUE)
-    ) %>%
-    select(-cluster_pretty_chr)
-  
-  # palette
-  if (is.null(palette)) {
-    palette <- c(K1="#264653", K2="#f38b20", K3="#ad2524")
-  } else {
-    stopifnot(all(c("K1","K2","K3") %in% names(palette)))
-  }
-  
-  # ---------- build subgroups: ALL / AD / non-AD ----------
-  dat_all    <- dat %>% mutate(subgroup = "ALL")
-  dat_ad     <- dat %>% filter(AD_status == "1") %>% mutate(subgroup = "AD")
-  dat_nonad  <- dat %>% filter(AD_status == "0") %>% mutate(subgroup = "non-AD")
-  
-  dat_sub <- bind_rows(dat_all, dat_ad, dat_nonad) %>%
-    mutate(
-      subgroup = factor(subgroup, levels = c("ALL","AD","non-AD"), ordered = TRUE)
+      subgroup = factor(subgroup, levels = c("ALL", "AD", "non-AD")),
+      x_group  = factor(x_group, levels = all_x_levels)
     )
   
-  # ---------- long format ----------
+  # ── long format ──
   dat_long <- dat_sub %>%
-    pivot_longer(all_of(vars), names_to = "variable", values_to = "value") %>%
-    mutate(variable = factor(variable, levels = vars, ordered = TRUE))
+    pivot_longer(all_of(plot_vars), names_to = "variable", values_to = "value") %>%
+    mutate(
+      variable = factor(outcome_labels[variable],
+                        levels = outcome_labels[plot_vars])
+    )
   
-  # ---------- Tukey annotations per (variable, subgroup) ----------
-  tukey_ann <- dat_long %>%
-    filter(!is.na(value)) %>%
-    group_by(variable, subgroup) %>%
-    group_modify(~{
-      df <- .x
-      n_per <- df %>% count(cluster)
-      if (nrow(n_per %>% filter(n >= 2)) < 2) return(tibble())
-      fit <- try(suppressWarnings(aov(value ~ cluster, data = df)), silent = TRUE)
-      if (inherits(fit, "try-error")) return(tibble())
-      tk <- try(suppressWarnings(TukeyHSD(fit, "cluster")), silent = TRUE)
-      if (inherits(tk, "try-error")) return(tibble())
-      tk_df <- as.data.frame(tk$cluster)
-      tk_df$contrast <- rownames(tk_df)
-      out <- tk_df %>%
-        transmute(
-          contrast,
-          group1 = stringr::str_extract(contrast, "^K[123]"),
-          group2 = stringr::str_extract(contrast, "K[123]$"),
-          p.adj  = `p adj`
-        ) %>%
-        filter(!is.na(group1), !is.na(group2)) %>%
-        mutate(stars = p_to_stars(p.adj)) %>%
-        filter(stars != "")
-      if (nrow(out) == 0) return(tibble())
-      y_max   <- max(df$value, na.rm = TRUE)
-      y_min   <- min(df$value, na.rm = TRUE)
-      y_range <- ifelse(is.finite(y_max - y_min) && (y_max - y_min) > 0, y_max - y_min, 1)
-      step    <- 0.07 * y_range
-      out %>%
-        arrange(p.adj) %>%
-        mutate(
-          y.position = y_max + (row_number()) * step,
-          xmin = prettify_cluster(group1),
-          xmax = prettify_cluster(group2)
-        )
-    }) %>%
-    ungroup()
+  # ── annotation helper ──
+  add_y_positions <- function(ann, dat_sub_long) {
+    y_stats <- dat_sub_long %>%
+      group_by(variable) %>%
+      summarise(
+        y_max   = max(value, na.rm = TRUE),
+        y_range = diff(range(value, na.rm = TRUE)),
+        .groups = "drop"
+      )
+    ann %>%
+      left_join(y_stats, by = "variable") %>%
+      group_by(variable) %>%
+      arrange(p_adj_BH) %>%
+      mutate(
+        step       = 0.07 * y_range,
+        y.position = y_max + row_number() * step
+      ) %>%
+      ungroup()
+  }
   
-  # ---------- plot ----------
-  p <- ggplot(dat_long, aes(x = cluster_pretty, y = value, fill = cluster)) +
-    geom_boxplot(width = 0.7, alpha = 0.85, colour = "black", outlier.shape = NA) +
-    geom_jitter(aes(color = cluster),
+  prep_ann <- function(results, axis_filter, subgrp) {
+    ann <- results %>%
+      filter(stars %in% c("*", "**", "***"),
+             variable %in% contrast_vars)
+    if (!is.null(axis_filter)) {
+      ann <- ann %>% filter(axis == axis_filter)
+    }
+    if (nrow(ann) == 0) return(tibble())
+    ann %>%
+      mutate(
+        variable = factor(outcome_labels[variable],
+                          levels = outcome_labels[plot_vars]),
+        subgroup = subgrp
+      ) %>%
+      add_y_positions(dat_long %>% filter(subgroup == subgrp))
+  }
+  
+  ann_ALL   <- prep_ann(contrast_results_all,        "within_ALL",     "ALL")
+  ann_AD    <- prep_ann(contrast_results_stratified,  "within_PathAD",  "AD")
+  ann_nonAD <- prep_ann(contrast_results_stratified,  "within_PathNon", "non-AD")
+  
+  ann_df <- bind_rows(ann_ALL, ann_AD, ann_nonAD) %>%
+    mutate(subgroup = factor(subgroup, levels = c("ALL", "AD", "non-AD")))
+  
+  # ── clean x labels ──
+  x_labeller <- function(x) {
+    x <- str_remove(x, "PathAD;")
+    x <- str_remove(x, "PathNon;")
+    x
+  }
+  
+  # ── plot ──
+  p <- ggplot(dat_long, aes(x = x_group, y = value, fill = tx_group)) +
+    geom_boxplot(width = 0.7, alpha = 0.85, colour = "black",
+                 outlier.shape = NA) +
+    geom_jitter(aes(color = tx_group),
                 width = 0.08, height = 0, size = 0.9, alpha = 0.4, shape = 16) +
-    scale_fill_manual(values = palette, name = "Cluster (Tx profile)") +
-    scale_color_manual(values = palette, guide = "none") +
+    scale_fill_manual(values  = tx_palette, name = "Tx Pathology") +
+    scale_color_manual(values = tx_palette, guide = "none") +
+    scale_x_discrete(labels = x_labeller) +
     scale_y_continuous(expand = expansion(mult = c(0.02, 0.15))) +
-    facet_grid(rows = vars(variable), cols = vars(subgroup), scales = "free_y", switch = "y") +
+    facet_grid(rows = vars(variable), cols = vars(subgroup),
+               scales = "free", switch = "y") +
     theme_classic(base_size = base_size) +
     theme(
-      strip.placement  = "outside",
-      strip.background = element_rect(fill = "grey95", colour = NA),
-      panel.spacing    = unit(0.8, "lines"),
-      legend.position  = "right",
-      axis.title.x     = element_blank(),
-      axis.title.y     = element_blank(),
-      axis.text.x      = element_text(angle = 45, hjust = 1, vjust = 1, size = rel(0.9)),
-      axis.ticks.x     = element_line()
+      strip.placement    = "outside",
+      strip.background   = element_rect(fill = "grey95", colour = NA),
+      panel.spacing      = unit(0.8, "lines"),
+      legend.position    = "right",
+      axis.title.x       = element_blank(),
+      axis.title.y       = element_blank(),
+      axis.text.x        = element_text(angle = 45, hjust = 1, vjust = 1,
+                                        size = rel(0.9)),
+      axis.ticks.x       = element_line()
     )
   
-  if (nrow(tukey_ann) > 0) {
+  if (nrow(ann_df) > 0) {
     p <- p + ggsignif::geom_signif(
-      data = tukey_ann,
-      aes(xmin = xmin, xmax = xmax, annotations = stars, y_position = y.position),
-      manual = TRUE,
-      tip_length = 0.01,
-      textsize = rel(3.5),
-      vjust = -0.1,
+      data        = ann_df,
+      aes(xmin        = g1,
+          xmax        = g2,
+          annotations = stars,
+          y_position  = y.position),
+      manual      = TRUE,
+      tip_length  = 0.01,
+      textsize    = rel(3.5),
+      vjust       = -0.1,
       inherit.aes = FALSE
     )
   }
   
-  # hide x labels for non-bottom rows
   g <- ggplotGrob(p)
-  lay_panels <- g$layout[g$layout$name == "panel", c("t","l","b","r","name")]
+  lay_panels <- g$layout[g$layout$name == "panel", , drop = FALSE]
   if (nrow(lay_panels) > 0) {
-    max_row <- max(lay_panels$t)
+    max_row    <- max(lay_panels$t)
     idx_axes_b <- which(grepl("^axis-b-\\d+-\\d+$", g$layout$name))
     for (i in idx_axes_b) {
-      nm <- g$layout$name[i]
-      rc <- as.integer(stringr::str_match(nm, "^axis-b-(\\d+)-(\\d+)$")[,2])
+      nm    <- g$layout$name[i]
+      rc    <- as.integer(stringr::str_match(
+        nm, "^axis-b-(\\d+)-(\\d+)$")[, 2])
       row_i <- rc[1]
       if (!is.na(row_i) && row_i < max_row) {
         ax_grob <- g$grobs[[i]]
         try({
-          if (!is.null(ax_grob$children[[2]])) ax_grob$children[[2]] <- grid::zeroGrob()
-          if (!is.null(ax_grob$grobs) && length(ax_grob$grobs) >= 2) ax_grob$grobs[[2]] <- grid::zeroGrob()
+          if (!is.null(ax_grob$children[[2]]))
+            ax_grob$children[[2]] <- grid::zeroGrob()
+          if (!is.null(ax_grob$grobs) && length(ax_grob$grobs) >= 2)
+            ax_grob$grobs[[2]] <- grid::zeroGrob()
         }, silent = TRUE)
         g$grobs[[i]] <- ax_grob
       }
     }
   }
   
-  # save PDF
   outfile <- file.path(out_dir, paste0(out_file_stem, ".pdf"))
   grDevices::pdf(outfile, width = width, height = height, useDingbats = FALSE)
-  grid::grid.newpage(); grid::grid.draw(g)
+  grid::grid.newpage()
+  grid::grid.draw(g)
   grDevices::dev.off()
+  message("Boxplot saved: ", normalizePath(outfile))
   
   invisible(list(
     plot        = p,
     data        = dat_long,
-    annotations = tukey_ann,
+    annotations = ann_df,
     outfile     = outfile
   ))
 }
 
-
-cluster_cols <- c(
-  "K1" = "#264653",
-  "K2" = "#f38b20",
-  "K3" = "#ad2524"
-)
-
-bx <- plot_cluster_boxpanels_faceted(
-  df_clusters,
-  vars          = c("gpath","cogn_decline","CR","pred_AD_prob_glmnet"),
-  palette       = cluster_cols,
-  out_dir       = "Results/Clustered_heatmaps/boxplots",
-  out_file_stem = "boxpanels_ANOVA_Tukey_faceted",
+bx6 <- plot_combined_boxplots(
+  df_paper,
+  contrast_results_all,
+  contrast_results_stratified,
+  plot_vars     = plot_vars,
+  contrast_vars = contrast_vars,
+  out_dir       = "Results/Clustered_heatmaps/contrasts",
+  out_file_stem = "boxplot_combined_contrasts",
   width         = 5,
   height        = 7,
   base_size     = 10
 )
 
-
-
+## ---------- 8.  SUMMARY ───────────────────────────────────────
+message("\n── Significant contrasts (BH-adj p < 0.05, pooled per outcome) ──")
+contrast_results %>%
+  filter(stars %in% c("*", "**", "***")) %>%
+  select(variable, contrast_set, contrast_label, n1, n2,
+         mean_diff, p_raw, p_adj_BH, stars) %>%
+  mutate(variable = outcome_labels[variable]) %>%
+  arrange(variable, contrast_set) %>%
+  print(n = Inf)
 ## ===== Differential metabolite analysis on heatmap clusters =====
 ## ---------- 1) Setup & Loading ---------
 suppressPackageStartupMessages({
@@ -1781,448 +2351,5 @@ message("✅ Saved:", normalizePath(out_pdf))
 
 
 
-
-
-## ===== Residualize metabolites by covariates =================
-suppressPackageStartupMessages({
-  library(dplyr); library(tidyr); library(purrr); library(stringr)
-})
-
-## ---------- Setups ----
-# metabolites: data.frame with "projid" + metabolite columns, created above
-
-COVARS <- c("pmi","study","fixation_interval","msex")
-
-suppressPackageStartupMessages({
-  library(dplyr); library(rlang)
-})
-metabolites <- metabolites %>% mutate(projid = as.character(projid))
-meta        <- meta %>% mutate(projid = as.character(projid))
-
-## ---------- 1) Build covariate df ----
-
-stopifnot(all(COVARS %in% names(meta)))
-
-cov_df <- meta %>%
-  select(projid, all_of(COVARS)) %>%
-  distinct(projid, .keep_all = TRUE) %>%         
-  mutate(
-    # numeric covariates
-    pmi               = suppressWarnings(as.numeric(pmi)),
-    fixation_interval = suppressWarnings(as.numeric(fixation_interval)),
-    # categorical covariates
-    study             = as.factor(study),
-    msex              = as.factor(msex)
-  )
-
-## ---------- 2) Join covariates to metabolites; keep only rows with complete covariates ----
-dat <- metabolites %>%
-  left_join(cov_df, by = "projid") %>%
-  filter(if_all(all_of(COVARS), ~ !is.na(.)))     
-
-# Identify metabolite columns 
-meta_cols <- setdiff(names(metabolites), "projid")
-stopifnot(length(meta_cols) > 0)
-
-## ---------- 3) Residualization function (y ~ covars per metabolite) ----
-residualize_one <- function(y, X_df) {
-  # rows with complete covariates and non-missing metabolite
-  ok <- complete.cases(X_df) & !is.na(y)
-  res <- rep(NA_real_, length(y))
-  coefs <- NA
-  
-  if (sum(ok) >= (ncol(model.matrix(~ ., data = X_df)) + 1)) {
-    # Build design matrix with intercept and default contrasts
-    X <- model.matrix(~ ., data = X_df[ok, , drop = FALSE])
-    fit <- lm.fit(x = X, y = y[ok])
-    res[ok] <- y[ok] - (X %*% fit$coefficients)[, 1]
-    coefs <- setNames(unname(fit$coefficients), colnames(X))
-  }
-  list(residuals = res, coefs = coefs)
-}
-
-# Prepare the covariate design table (no ID)
-X_all <- dat %>% select(all_of(COVARS))
-
-## ---------- 4) Apply to every metabolite ----
-res_list <- lapply(meta_cols, function(met) {
-  out <- residualize_one(dat[[met]], X_all)
-  list(name = met, resid = out$residuals, coefs = out$coefs)
-})
-
-# Collect residuals into a wide data.frame
-res_mat <- do.call(cbind, lapply(res_list, `[[`, "resid"))
-colnames(res_mat) <- paste0(meta_cols, "_res")
-metabolites_resid <- cbind(projid = dat$projid, as.data.frame(res_mat))
-
-## ---------- 5) Save outputs ----
-dir.create("Results/Metabolites_residualized", recursive = TRUE, showWarnings = FALSE)
-saveRDS(metabolites_resid, file = "Results/Metabolites_residualized/metabolites_residualized_by_pmi_study_fix_msex.rds")
-
-coef_tbl <- purrr::map_dfr(res_list, function(x) {
-  tibble(metabolite = x$name,
-         term = names(x$coefs),
-         estimate = unname(x$coefs))
-})
-saveRDS(coef_tbl, file = "Results/Metabolites_residualized/metabolite_models_coefficients.rds")
-
-## ---------- 6) sanity checks ----
-message("Residualized matrix dims: ", nrow(metabolites_resid), " x ", ncol(metabolites_resid))
-message("Example head (first 5 residualized metabolites):")
-print(metabolites_resid[1:5, c("projid", colnames(metabolites_resid)[2:min(6, ncol(metabolites_resid))])])
-
-
-
-
-
-
-## ===== Projid overlap metabolites and single cell data
-
-meta<-load_BIG_meta_data()
-
-library(eulerr)
-
-ids <- list(
-  metabolites_resid = unique(as.character(metabolites_resid$projid)),
-  merged_df_final   = unique(as.character(merged_df_final$projid)),
-  meta              = unique(as.character(meta$projid))
-)
-
-plot(
-  euler(ids),
-  quantities = TRUE, labels = TRUE,
-  fills = list(fill = c("#4E79A7","#F28E2B","#E15759"), alpha = 0.35),
-  edges = list(col = "grey20"),
-  main = "projid overlap"
-)
-
-# Define ID sets
-ids <- list(
-  metabolites_resid = unique(as.character(metabolites_resid$projid)),
-  merged_df_final   = unique(as.character(merged_df_final$projid))
-)
-
-# Generate Euler diagram
-pdf("Results/projid_overlap_metabolites_vs_merged_df_final.pdf", width = 4, height = 4)
-
-plot(
-  euler(ids),
-  quantities = TRUE,
-  labels = TRUE,
-  fills = list(fill = c("#606c38", "#bc6c25"), alpha = 0.85),
-  edges = list(col = "grey20"),
-  main = "projid overlap (metabolites vs merged_df_final)"
-)
-
-dev.off()
-
-# --- Collect unique IDs ---
-met_ids <- unique(as.character(metabolites_resid$projid))
-sc_ids  <- unique(as.character(merged_df_final$projid))
-
-# --- Compute sets ---
-met_only      <- setdiff(met_ids, sc_ids)
-singlecell_only <- setdiff(sc_ids, met_ids)
-both          <- intersect(met_ids, sc_ids)
-
-# --- Assemble into a tidy data frame ---
-projid_df <- data.frame(
-  projid = c(met_only, singlecell_only, both),
-  group  = c(
-    rep("metabolites_only", length(met_only)),
-    rep("singlecell_only", length(singlecell_only)),
-    rep("metabolites_and_singlecell", length(both))
-  ),
-  stringsAsFactors = FALSE
-)
-
-head(projid_df)
-
-
-## ===== final GLMNET approach =====
-suppressPackageStartupMessages({
-  library(dplyr); library(readr); library(ggplot2)
-  library(pROC); library(yardstick); library(glmnet); library(broom)
-  library(patchwork)
-})
-
-set.seed(123)
-OUT <- "Results/GLMNET_AD_solid"
-dir.create(OUT, recursive = TRUE, showWarnings = FALSE)
-
-## ---------- 0) Inputs & labels from meta  +  collapse replicates by projid (median) ----------
-suppressPackageStartupMessages({ library(dplyr) })
-
-meta <- load_BIG_meta_data()
-
-stopifnot(all(c("projid") %in% names(metabolites_resid)))
-stopifnot(all(c("projid","AD_status") %in% names(meta)))
-stopifnot(length(met_only) > 0, length(both) > 0)
-
-# 1) Build a deduplicated label table (one row per projid)
-label_raw <- meta %>%
-  mutate(projid = as.character(projid)) %>%
-  select(projid, AD_status) %>%
-  filter(!is.na(AD_status))
-
-# check for conflicts
-label_chk <- label_raw %>%
-  group_by(projid) %>%
-  summarise(n = n(), n_pos = sum(AD_status == 1), n_neg = sum(AD_status == 0), .groups = "drop")
-
-conflicts <- label_chk %>% filter(n_pos > 0 & n_neg > 0)
-if (nrow(conflicts) > 0) {
-  warning("Conflicting AD_status for some projid in meta; resolving by majority vote (ties -> 1).")
-}
-
-label_df <- label_raw %>%
-  group_by(projid) %>%
-  summarise(
-    AD_status = {
-      v <- AD_status
-      ones <- sum(v == 1); zeros <- sum(v == 0)
-      if (zeros > ones) 0L else 1L
-    },
-    .groups = "drop"
-  ) %>%
-  mutate(AD_status = as.integer(AD_status))
-
-# 2) Collapse metabolite replicates (median)
-agg_fun <- function(x) suppressWarnings(stats::median(x, na.rm = TRUE))
-feat_cols_all <- grep("_res$", names(metabolites_resid), value = TRUE)
-stopifnot(length(feat_cols_all) > 0)
-
-met_agg <- metabolites_resid %>%
-  mutate(projid = as.character(projid)) %>%
-  group_by(projid) %>%
-  summarise(
-    dplyr::across(all_of(feat_cols_all), agg_fun),
-    n_reps = dplyr::n(),
-    .groups = "drop"
-  )
-
-# 3) Join (labels are now unique per projid)
-dat_all <- met_agg %>%
-  inner_join(label_df, by = "projid") %>%
-  filter(AD_status %in% c(0,1))
-
-feat_cols <- grep("_res$", names(dat_all), value = TRUE)
-stopifnot(length(feat_cols) > 0)
-
-# 4) Split & matrices
-train_df <- dat_all %>% filter(projid %in% as.character(met_only))
-test_df  <- dat_all %>% filter(projid %in% as.character(both))
-
-
-stopifnot(nrow(train_df) == dplyr::n_distinct(train_df$projid))
-stopifnot(nrow(test_df)  == dplyr::n_distinct(test_df$projid))
-
-X_tr_raw <- as.matrix(train_df[, feat_cols, drop = FALSE])
-X_te_raw <- as.matrix(test_df[,  feat_cols, drop = FALSE])
-y_tr <- train_df$AD_status
-y_te <- test_df$AD_status
-
-message("Projids in train_df:", length(train_df$projid), " Projids in test_df:", length(test_df$projid))
-
-message("Replicate collapse complete: TRAIN projids = ", nrow(train_df),
-        " | TEST projids = ", nrow(test_df))
-
-
-
-## ---------- 1) Train-only imputation & scaling  --------
-med_tr <- apply(X_tr_raw, 2, function(v) suppressWarnings(median(v, na.rm = TRUE)))
-med_tr[!is.finite(med_tr)] <- 0
-impute <- function(M, med) { if (anyNA(M)) { idx <- which(is.na(M), arr.ind = TRUE); M[idx] <- med[idx[,2]] }; M }
-X_tr_imp <- impute(X_tr_raw, med_tr); X_te_imp <- impute(X_te_raw, med_tr)
-
-mu  <- colMeans(X_tr_imp)
-sdv <- apply(X_tr_imp, 2, sd); sdv[!is.finite(sdv) | sdv == 0] <- 1
-scale_mat <- function(M, mu, sdv) sweep(sweep(M, 2, mu, "-"), 2, sdv, "/")
-X_tr_sc <- scale_mat(X_tr_imp, mu, sdv); X_te_sc <- scale_mat(X_te_imp, mu, sdv)
-
-## ---------- 2) Nested CV: tune alpha & lambda --------
-# Outer CV selects alpha; inner CV selects lambda for each alpha.
-alphas <- c(0.0, 0.25, 0.5, 0.75, 1.0)
-Kouter <- 5
-fold_id <- sample(rep(1:Kouter, length.out = length(y_tr)))
-
-w_class <- if (sum(y_tr==1)>0) ifelse(y_tr==1, sum(y_tr==0)/sum(y_tr==1), 1) else rep(1, length(y_tr))
-
-outer_auc <- data.frame(alpha = numeric(), auc = numeric())
-for (a in alphas) {
-  cv_inner <- cv.glmnet(X_tr_sc, y_tr, family = "binomial", alpha = a,
-                        type.measure = "auc", weights = w_class, nfolds = 10,
-                        standardize = FALSE)
-  lam <- cv_inner$lambda.1se
-  # outer CV estimate using chosen lam
-  preds <- rep(NA_real_, length(y_tr))
-  for (k in 1:Kouter) {
-    tr_idx <- which(fold_id != k); va_idx <- which(fold_id == k)
-    fit_k <- glmnet(X_tr_sc[tr_idx, , drop = FALSE], y_tr[tr_idx],
-                    family = "binomial", alpha = a, lambda = lam,
-                    weights = w_class[tr_idx], standardize = FALSE)
-    preds[va_idx] <- as.numeric(predict(fit_k, X_tr_sc[va_idx, , drop = FALSE], type = "response"))
-  }
-  auc_k <- as.numeric(pROC::auc(y_tr, preds))
-  outer_auc <- rbind(outer_auc, data.frame(alpha = a, auc = auc_k))
-}
-best_alpha <- outer_auc$alpha[which.max(outer_auc$auc)]
-readr::write_csv(outer_auc, file.path(OUT, "nested_outer_auc_alpha.csv"))
-
-## ---------- 3) Fit final model on all TRAIN with best alpha + lambda.1se (inner CV) ----
-cv_final <- cv.glmnet(X_tr_sc, y_tr, family = "binomial", alpha = best_alpha,
-                      type.measure = "auc", weights = w_class, nfolds = 10, standardize = FALSE)
-lam_final <- cv_final$lambda.1se
-fit_glm <- glmnet(X_tr_sc, y_tr, family = "binomial", alpha = best_alpha,
-                  lambda = lam_final, weights = w_class, standardize = FALSE)
-
-## ---------- 4) Predict on HELD-OUT TEST --------
-p_te <- as.numeric(predict(fit_glm, X_te_sc, type = "response"))
-
-## ---------- 5) Metrics, threshold grid, and plots --------
-brier <- mean((p_te - y_te)^2)
-logloss <- { p <- pmin(pmax(p_te,1e-15),1-1e-15); -mean(y_te*log(p)+(1-y_te)*log(1-p)) }
-auc_te <- as.numeric(pROC::auc(y_te, p_te))
-eval_te <- tibble(AD_status = factor(y_te, levels=c(0,1), labels=c("nonAD","AD")), .pred_AD = p_te)
-pr_te <- yardstick::pr_auc(eval_te, truth = AD_status, .pred_AD)$.estimate
-roc_te <- yardstick::roc_curve(eval_te, truth = AD_status, .pred_AD)
-prc_te <- yardstick::pr_curve(eval_te, truth = AD_status, .pred_AD)
-
-# Youden threshold
-th_te <- roc_te %>%
-  mutate(J = sensitivity + specificity - 1) %>%
-  slice_max(J, n = 1) %>% slice_head(n = 1) %>% pull(.threshold) %>% as.numeric()
-if (!is.finite(th_te)) th_te <- 0.5
-
-# Threshold grid
-ths <- seq(0,1,by=0.01)
-grid <- lapply(ths, function(t) {
-  lab <- factor(ifelse(p_te >= t, "AD","nonAD"), levels=c("nonAD","AD"))
-  tibble(
-    threshold = t,
-    accuracy = yardstick::accuracy_vec(eval_te$AD_status, lab),
-    sensitivity = yardstick::sensitivity_vec(eval_te$AD_status, lab),
-    specificity = yardstick::specificity_vec(eval_te$AD_status, lab),
-    ppv = yardstick::ppv_vec(eval_te$AD_status, lab),
-    npv = yardstick::npv_vec(eval_te$AD_status, lab)
-  )
-}) %>% bind_rows()
-write_csv(grid, file.path(OUT, "threshold_grid_test.csv"))
-
-# Save metrics summary
-write_csv(
-  tibble(model="GLMNET", alpha=best_alpha, lambda=lam_final,
-         auc=auc_te, pr_auc=pr_te, brier=brier, log_loss=logloss,
-         threshold_Youden=th_te),
-  file.path(OUT,"metrics_test_summary.csv")
-)
-
-# Plots
-p_roc <- ggplot(roc_te, aes(x = 1 - specificity, y = sensitivity)) +
-  geom_path() + coord_equal() + theme_classic() + ggtitle(sprintf("ROC (AUC = %.3f)", auc_te))
-ggsave(file.path(OUT,"ROC_glmnet.pdf"), p_roc, width=5, height=4)
-
-p_pr <- ggplot(prc_te, aes(x = recall, y = precision)) +
-  geom_path() + theme_classic() + ggtitle(sprintf("PR (PR-AUC = %.3f)", pr_te))
-ggsave(file.path(OUT,"PR_glmnet.pdf"), p_pr, width=5, height=4)
-
-
-p_dens <- ggplot(
-  tibble(pred = p_te, AD_status = factor(y_te, levels = c(0, 1), labels = c("nonAD", "AD"))),
-  aes(x = pred, fill = AD_status)
-) +
-  geom_density(alpha = 0.45) +
-  geom_vline(xintercept = th_te, linetype = "dashed") +
-  scale_fill_manual(values = c("nonAD" = "blue", "AD" = "red")) +
-  theme_classic() +
-  labs(
-    x = "Predicted AD probability",
-    y = "Density",
-    title = "Prediction distribution"
-  )
-ggsave(file.path(OUT, "pred_density_by_true_status.pdf"), p_dens, width = 6, height = 4)
-
-# Calibration (reliability) curve via deciles
-cal_df <- tibble(pred=p_te, y=y_te) %>%
-  mutate(bin = cut(pred, breaks = quantile(pred, probs = seq(0,1,0.1), na.rm=TRUE),
-                   include.lowest = TRUE)) %>%
-  group_by(bin) %>%
-  summarise(pred_mean = mean(pred), obs_rate = mean(y), .groups="drop")
-p_cal <- ggplot(cal_df, aes(x=pred_mean, y=obs_rate)) +
-  geom_abline(slope=1, intercept=0, linetype="dotted") +
-  geom_point() + geom_line() + coord_equal() +
-  theme_classic() + labs(x="Mean predicted probability", y="Observed AD rate", title="Calibration (deciles)")
-ggsave(file.path(OUT,"calibration_deciles.pdf"), p_cal, width=5.2, height=5)
-
-## ---------- 6) Export per-donor TEST predictions --------
-pred_test <- tibble(
-  projid = test_df$projid,
-  AD_status_true = factor(y_te, levels=c(0,1), labels=c("nonAD","AD")),
-  pred_AD_prob_glmnet = p_te,
-  pred_AD_label_glmnet = factor(ifelse(p_te >= th_te, "AD","nonAD"), levels=c("nonAD","AD")),
-  threshold_used = th_te
-)
-write_csv(pred_test, file.path(OUT,"predictions_test_both.csv"))
-
-## ---------- 7) merge into merged_df_final
-if (exists("merged_df_final")) {
-  merged_df_final <- merged_df_final %>%
-    mutate(projid = as.character(projid)) %>%
-    left_join(pred_test %>% select(projid, pred_AD_prob_glmnet, pred_AD_label_glmnet),
-              by = "projid")
-  saveRDS(merged_df_final, file.path(OUT,"merged_df_final_with_glmnet_preds.rds"))
-}
-
-## ---------- 8) Feature importance --------
-# (A) Coefficients at final lambda (standardized scale)
-coef_tbl <- as.matrix(coef(fit_glm))[,1, drop = FALSE]
-coef_tbl <- tibble(Feature = rownames(coef_tbl), Coef = as.numeric(coef_tbl)) %>%
-  filter(Feature != "(Intercept)") %>% arrange(desc(abs(Coef)))
-write_csv(coef_tbl, file.path(OUT,"coefficients_final.csv"))
-
-p_coef <- ggplot(head(coef_tbl, 25), aes(x = reorder(Feature, abs(Coef)), y = Coef)) +
-  geom_col() + coord_flip() + theme_classic() + labs(x=NULL, y="Standardized coefficient",
-                                                     title="Top 25 |β| (GLMNET)")
-ggsave(file.path(OUT,"importance_coefficients_top25.pdf"), p_coef, width=6.5, height=5)
-
-# (B) Permutation importance on TEST (AUC drop per feature)
-perm_imp <- lapply(feat_cols, function(f) {
-  X_perm <- X_te_sc
-  X_perm[, f] <- sample(X_perm[, f])
-  p_perm <- as.numeric(predict(fit_glm, X_perm, type="response"))
-  data.frame(Feature=f, delta_auc = auc_te - as.numeric(pROC::auc(y_te, p_perm)))
-}) %>% bind_rows() %>% arrange(desc(delta_auc))
-write_csv(perm_imp, file.path(OUT,"importance_permutation_auc_drop_test.csv"))
-
-p_perm <- ggplot(head(perm_imp, 25), aes(x = reorder(Feature, delta_auc), y = delta_auc)) +
-  geom_col() + coord_flip() + theme_classic() + labs(x=NULL, y="AUC drop on permutation",
-                                                     title="Permutation importance (TEST)")
-ggsave(file.path(OUT,"importance_permutation_top25.pdf"), p_perm, width=6.5, height=5)
-
-# (C) Stability selection (bootstrap selection frequency on TRAIN)
-B <- 100
-set.seed(123)
-sel_freq <- setNames(numeric(length(feat_cols)), feat_cols)
-for (b in 1:B) {
-  idx <- sample.int(nrow(X_tr_sc), replace = TRUE)
-  cvb <- cv.glmnet(X_tr_sc[idx, , drop = FALSE], y_tr[idx],
-                   family="binomial", alpha=best_alpha, type.measure="auc",
-                   weights=w_class[idx], nfolds=5, standardize=FALSE)
-  fitb <- glmnet(X_tr_sc[idx, , drop = FALSE], y_tr[idx], family="binomial",
-                 alpha=best_alpha, lambda=cvb$lambda.1se, weights=w_class[idx], standardize=FALSE)
-  nz <- rownames(coef(fitb))[which(as.numeric(coef(fitb)) != 0)]
-  nz <- setdiff(nz, "(Intercept)")
-  sel_freq[nz] <- sel_freq[nz] + 1
-}
-stab_tbl <- tibble(Feature = names(sel_freq), sel_freq = as.numeric(sel_freq)/B) %>%
-  arrange(desc(sel_freq))
-write_csv(stab_tbl, file.path(OUT,"importance_stability_selection_freq.csv"))
-
-p_stab <- ggplot(head(stab_tbl, 25), aes(x = reorder(Feature, sel_freq), y = sel_freq)) +
-  geom_col() + coord_flip() + theme_classic() +
-  labs(x=NULL, y="Selection frequency", title="Stability selection (TRAIN bootstraps)")
-ggsave(file.path(OUT,"importance_stability_top25.pdf"), p_stab, width=6.5, height=5)
-
-message("✅ GLMNET pipeline done. Outputs in: ", normalizePath(OUT))
 
 
