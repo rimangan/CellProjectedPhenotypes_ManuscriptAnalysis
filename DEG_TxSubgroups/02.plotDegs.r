@@ -457,14 +457,97 @@ deg_all %>% filter(str_detect(gene, "SLC22")) %>% filter(celltype == "Mic P2RY12
 ########################## CPP Tx and C/C Separate #############################
 ################################################################################
 
-cc_plot_data <- deg_summary %>%
-  filter(category %in% c("CaseControlOnly", "Shared")) %>%
-  group_by(celltype, direction) %>%
-  summarise(count = sum(count), .groups = "drop") %>%
-  mutate(
-    signed_count = ifelse(direction == "Up", count, -count),
-    celltype = factor(celltype, levels = rev(cellOrder))
-  )
+################################################################################
+################################ DEG Counts ####################################
+################################################################################
+cellOrder <- c(
+  "Exc L3-5 RORB PLCH1",
+  "Exc L2-3 CBLN2 LINC02306",
+  "Exc L6 THEMIS NFIA",
+  "Exc L5-6 IT Car3",
+  "Exc L4-5 RORB GABRG1",
+  "Exc L3-4 RORB CUX2",
+  "Exc L5-6 RORB LINC02196",
+  "Exc L4-5 RORB IL1RAPL2",
+  "Exc L6 CT",
+  "Exc L6b",
+  "Exc RELN CHD7",
+  "Exc L5-6 NP",
+  "Exc NRGN",
+  "Inh L1-6 LAMP5 CA13",
+  "Inh RYR3 TSHZ2",
+  "Inh ALCAM TRPM3",
+  "Inh PVALB SULF1",
+  "Inh PVALB CA8 (Chandelier)",
+  "Inh PVALB HTR4",
+  "Inh VIP ABI3BP",
+  "Inh VIP CLSTN2",
+  "Inh VIP TSHZ2",
+  "Inh VIP THSD7B",
+  "Inh ENOX2 SPHKAP",
+  "Inh L3-5 SST MAFB",
+  "Inh LAMP5 NRG1 (Rosehip)",
+  "Inh SORCS1 TTN",  
+  "Inh PTPRK FAM19A1",
+  "Inh CUX2 MSR1",
+  "Ast GRM3",
+  "Ast DPP10",
+  "Ast CHI3L1",
+  "Oli",
+  "OPC",
+  "Mic P2RY12"
+)
+
+files <- list.files("ResultsNoApoeCovariate", pattern = "\\.rds$", full.names = TRUE) #one file per cell type
+get_cell_type <- function(file_path) {
+  file_name <- basename(file_path)
+  str_remove(file_name, "\\.rds$")
+}
+
+pthreshold <- 0.01
+logfcThreshold <- 1
+
+deg_summary <- lapply(files, function(f) {
+  obj <- readRDS(f)
+  celltype <- get_cell_type(f)
+  # Convert DESeqResults objects to standard data.frames
+  sg <- as.data.frame(obj$subgroups) %>%
+    rownames_to_column("gene") %>%
+    filter(!is.na(padj)) %>%
+    mutate(sig = padj < pthreshold & abs(log2FoldChange) >= logfcThreshold)
+  cc <- as.data.frame(obj$casecontrol) %>%
+    rownames_to_column("gene") %>%
+    filter(!is.na(padj)) %>%
+    mutate(sig = padj < pthreshold & abs(log2FoldChange) >= logfcThreshold)
+  merged <- full_join(
+    cc %>% select(gene, log2FoldChange_cc = log2FoldChange, sig_cc = sig),
+    sg %>% select(gene, log2FoldChange_sg = log2FoldChange, sig_sg = sig),
+    by = "gene"
+  ) %>%
+    mutate(
+      sig_cc = coalesce(sig_cc, FALSE),
+      sig_sg = coalesce(sig_sg, FALSE)
+    )
+  
+  merged <- merged %>%
+    mutate(category = case_when(
+      sig_cc & sig_sg  ~ "Shared",
+      sig_cc & !sig_sg ~ "CaseControlOnly",
+      !sig_cc & sig_sg ~ "SubgroupOnly",
+      TRUE             ~ "NotSig"
+    )) %>%
+    mutate(direction = case_when(
+      !is.na(log2FoldChange_sg) ~ ifelse(log2FoldChange_sg > 0, "Up", "Down"),
+      !is.na(log2FoldChange_cc) ~ ifelse(log2FoldChange_cc > 0, "Up", "Down"),
+      TRUE                      ~ NA_character_
+    )) %>%
+    mutate(celltype = celltype) %>%
+    group_by(category, direction) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    mutate(celltype = celltype)
+  merged
+}) %>% bind_rows()
+
 
 sg_plot_data_simple <- deg_summary %>%
   filter(category %in% c("SubgroupOnly", "Shared")) %>%
@@ -480,23 +563,6 @@ direction_colors <- c(
   "Up" = "#e76f51",
   "Down" = "#264653"
 )
-
-# Case/Control plot
-p_cc <- ggplot(cc_plot_data, aes(x = celltype, y = signed_count, fill = direction)) +
-  geom_col() +
-  coord_flip() +
-  scale_fill_manual(values = direction_colors, name = "Direction") +
-  theme_classic() +
-  labs(
-    x = NULL,
-    y = "Number of DEGs",
-    title = "Case/Control"
-  ) +
-  theme(
-    axis.text.y = element_text(size = 9),
-    legend.position = "right"
-  )
-
 
 pdf("pdf/degSummary.main.pdf", height=5, width=7)
 ggplot(sg_plot_data_simple, aes(x = celltype, y = signed_count, fill = direction)) +
@@ -1794,54 +1860,90 @@ dev.off()
 
 
 
-# 3/17/2026 new DEG counts with c/c side by side
+# 3/18/2026 new DEG counts with c/c side by side
 
 library(patchwork)
 library(tidyr)
 
-# --- (i) Ensure all cell types present in C/C, even if 0 DEGs ---
-cc_plot_data <- deg_summary %>%
-  filter(category %in% c("CaseControlOnly", "Shared")) %>%
-  group_by(celltype, direction) %>%
-  summarise(count = sum(count), .groups = "drop") %>%
-  # complete against ALL cellOrder levels × both directions, fill 0
-  complete(
-    celltype = cellOrder,
-    direction = c("Up", "Down"),
-    fill = list(count = 0)
-  ) %>%
-  mutate(
-    signed_count = ifelse(direction == "Up", count, -count),
-    celltype = factor(celltype, levels = rev(cellOrder))
-  )
+# ── preprocessing (unchanged from original) ──────────────────────────
+files <- list.files("ResultsNoApoeCovariate", pattern = "\\.rds$", full.names = TRUE)
+get_cell_type <- function(file_path) str_remove(basename(file_path), "\\.rds$")
 
-sg_plot_data_simple <- deg_summary %>%
+pthreshold   <- 0.01
+logfcThreshold <- 1
+
+deg_merged <- lapply(files, function(f) {
+  obj      <- readRDS(f)
+  celltype <- get_cell_type(f)
+  
+  sg <- as.data.frame(obj$subgroups) %>%
+    rownames_to_column("gene") %>%
+    filter(!is.na(padj)) %>%
+    mutate(sig = padj < pthreshold & abs(log2FoldChange) >= logfcThreshold)
+  
+  cc <- as.data.frame(obj$casecontrol) %>%
+    rownames_to_column("gene") %>%
+    filter(!is.na(padj)) %>%
+    mutate(sig = padj < pthreshold & abs(log2FoldChange) >= logfcThreshold)
+  
+  full_join(
+    cc %>% select(gene, log2FoldChange_cc = log2FoldChange, sig_cc = sig),
+    sg %>% select(gene, log2FoldChange_sg = log2FoldChange, sig_sg = sig),
+    by = "gene"
+  ) %>%
+    mutate(
+      sig_cc   = coalesce(sig_cc, FALSE),
+      sig_sg   = coalesce(sig_sg, FALSE),
+      category = case_when(
+        sig_cc & sig_sg  ~ "Shared",
+        sig_cc & !sig_sg ~ "CaseControlOnly",
+        !sig_cc & sig_sg ~ "SubgroupOnly",
+        TRUE             ~ "NotSig"
+      ),
+      celltype = celltype
+    )
+}) %>% bind_rows()
+
+# ── CPP panel data: direction from subgroup LFC ──────────────────────
+sg_plot_data_simple <- deg_merged %>%
   filter(category %in% c("SubgroupOnly", "Shared")) %>%
+  mutate(direction = ifelse(log2FoldChange_sg > 0, "Up", "Down")) %>%
   group_by(celltype, direction) %>%
-  summarise(count = sum(count), .groups = "drop") %>%
+  summarise(count = n(), .groups = "drop") %>%
   complete(
-    celltype = cellOrder,
+    celltype  = cellOrder,
     direction = c("Up", "Down"),
-    fill = list(count = 0)
+    fill      = list(count = 0)
   ) %>%
   mutate(
     signed_count = ifelse(direction == "Up", count, -count),
-    celltype = factor(celltype, levels = rev(cellOrder))
+    celltype     = factor(celltype, levels = rev(cellOrder))
   )
 
-# --- (ii) Compute a shared scale via proportional panel widths ---
-max_sg <- max(abs(sg_plot_data_simple$signed_count))
-max_cc <- max(abs(cc_plot_data$signed_count))
+# ── C/C panel data: direction from case/control LFC ─────────────────
+cc_plot_data <- deg_merged %>%
+  filter(category %in% c("CaseControlOnly", "Shared")) %>%
+  mutate(direction = ifelse(log2FoldChange_cc > 0, "Up", "Down")) %>%
+  group_by(celltype, direction) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  complete(
+    celltype  = cellOrder,
+    direction = c("Up", "Down"),
+    fill      = list(count = 0)
+  ) %>%
+  mutate(
+    signed_count = ifelse(direction == "Up", count, -count),
+    celltype     = factor(celltype, levels = rev(cellOrder))
+  )
 
-# Both panels will use symmetric limits based on their own max,
-# but physical width is proportional to that max → same inches/DEG
-sg_lim <- ceiling(max_sg / 50) * 50   # round up to nice number
-cc_lim <- ceiling(max_cc / 50) * 50
+# ── axis limits ──────────────────────────────────────────────────────
+sg_lim <- ceiling(max(abs(sg_plot_data_simple$signed_count)) / 50) * 50
+cc_lim <- ceiling(max(abs(cc_plot_data$signed_count))        / 50) * 50
 
-direction_colors <- c("Up" = "#e76f51", "Down" = "#264653")
+direction_colors    <- c("Up" = "#e76f51", "Down" = "#264653")
 cc_direction_colors <- c("Up" = "#ea2728", "Down" = "#3a54a4")
 
-# --- CPP (Subgroup) panel ---
+# ── CPP panel ────────────────────────────────────────────────────────
 p_sg <- ggplot(sg_plot_data_simple, aes(x = celltype, y = signed_count, fill = direction)) +
   geom_col() +
   geom_text(
@@ -1861,7 +1963,7 @@ p_sg <- ggplot(sg_plot_data_simple, aes(x = celltype, y = signed_count, fill = d
   labs(x = NULL, y = "Number of DEGs", title = "CPP") +
   theme(axis.text.y = element_text(size = 9), legend.position = "none")
 
-# --- C/C panel (drop y-axis labels to avoid redundancy) ---
+# ── C/C panel ────────────────────────────────────────────────────────
 p_cc <- ggplot(cc_plot_data, aes(x = celltype, y = signed_count, fill = direction)) +
   geom_col() +
   geom_text(
@@ -1880,13 +1982,12 @@ p_cc <- ggplot(cc_plot_data, aes(x = celltype, y = signed_count, fill = directio
   theme_classic() +
   labs(x = NULL, y = "Number of DEGs", title = "Case/Control") +
   theme(
-    axis.text.y = element_blank(),
+    axis.text.y  = element_blank(),
     axis.ticks.y = element_blank(),
     legend.position = "right"
   )
 
-# --- Combine with proportional widths ---
-# widths proportional to axis range → 1 physical inch = same # of DEGs
+# ── Combine ──────────────────────────────────────────────────────────
 combined <- p_sg + p_cc + plot_layout(widths = c(sg_lim, cc_lim))
 pdf("pdf/degSummary.main.twopanel.pdf", height = 5, width = 10)
 print(combined)
